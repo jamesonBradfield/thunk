@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""harness.py — Headless, file-based AI agent router.
+"""thunkd.py — Headless, file-based AI agent daemon.
 
 Environment variables:
-  ARIADNE_MODEL        LiteLLM model string (default: openai/local)
-  ARIADNE_API_BASE     Base URL for the LLM API (default: http://localhost:8080/v1)
-  ARIADNE_POLL         Watcher poll interval in seconds (default: 1.0)
-  ARIADNE_CHILD_POLL   Child-task poll interval in seconds (default: 0.5)
-  OPENAI_API_KEY       API key — not required for llama-server (uses dummy value)
+  THUNK_MODEL        LiteLLM model string (default: openai/local)
+  THUNK_API_BASE     Base URL for the LLM API (default: http://localhost:8080/v1)
+  THUNK_POLL         Watcher poll interval in seconds (default: 1.0)
+  THUNK_CHILD_POLL   Child-task poll interval in seconds (default: 0.5)
+  OPENAI_API_KEY     API key — not required for llama-server (uses dummy value)
+  THUNK_LSP_CMD      Executable for the LSP-MCP server (optional; enables real QueryLSP)
+  THUNK_LSP_ARGS     Space-separated args for the LSP-MCP server (optional)
 
-Drop a JSON file into .ariadne/ with this shape and the harness picks it up:
+Drop a JSON file into .thunk/ with this shape and the daemon picks it up:
   {"id": "task_1", "intent": "...", "allowed_tools": [...], "status": "pending"}
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import sys
 import threading
 import time
 import traceback
@@ -30,11 +34,105 @@ from pydantic import BaseModel, ValidationError
 # Configuration
 # ---------------------------------------------------------------------------
 
-ARIADNE_DIR = Path(".ariadne")
-MODEL = os.getenv("ARIADNE_MODEL", "openai/local")
-API_BASE = os.getenv("ARIADNE_API_BASE", "http://localhost:8080/v1")
-POLL_INTERVAL = float(os.getenv("ARIADNE_POLL", "1.0"))
-CHILD_POLL_INTERVAL = float(os.getenv("ARIADNE_CHILD_POLL", "0.5"))
+THUNK_DIR = Path(".thunk")
+MODEL = os.getenv("THUNK_MODEL", "openai/local")
+API_BASE = os.getenv("THUNK_API_BASE", "http://localhost:8080/v1")
+POLL_INTERVAL = float(os.getenv("THUNK_POLL", "1.0"))
+CHILD_POLL_INTERVAL = float(os.getenv("THUNK_CHILD_POLL", "0.5"))
+
+# ---------------------------------------------------------------------------
+# Tool loader
+# ---------------------------------------------------------------------------
+
+_EXT_TO_LANG: dict[str, str] = {
+    ".py": "python",
+    ".rs": "rust",
+    ".js": "javascript",
+    ".ts": "typescript",
+    ".go": "go",
+    ".c": "c",
+    ".cpp": "cpp",
+}
+
+
+def _load_tools() -> dict[str, Any]:
+    """Import ../ariadne primitives and return a name→callable map.
+
+    Returns an empty dict (triggering mock fallback) if the package is absent
+    or any required dependency is missing.
+    """
+    ariadne_root = Path(__file__).resolve().parent.parent / "ariadne"
+    if not ariadne_root.exists():
+        return {}
+    pkg_dir = str(ariadne_root)
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
+
+    try:
+        from ariadne.primitives import ASTSplice as _ASTSplice
+        from ariadne.primitives import ExtractAST as _ExtractAST
+        from ariadne.lsp import LSPManager as _LSPManager
+    except ImportError as exc:
+        print(f"[thunkd] WARN: ariadne import failed — {exc}")
+        return {}
+
+    # Cache ExtractAST instances by language (parser init is expensive)
+    _ast_cache: dict[str, _ExtractAST] = {}
+
+    def _get_extractor(lang: str) -> Optional[_ExtractAST]:
+        if lang in _ast_cache:
+            return _ast_cache[lang]
+        try:
+            pkg = importlib.import_module(f"tree_sitter_{lang}")
+            lang_ptr = pkg.language() if hasattr(pkg, "language") else getattr(pkg, lang)()
+            inst = _ExtractAST(lang_ptr)
+            _ast_cache[lang] = inst
+            return inst
+        except Exception as exc:
+            print(f"[thunkd] WARN: cannot load tree-sitter-{lang}: {exc}")
+            return None
+
+    def extract_ast(
+        filepath: str, query_string: str, capture_name: str = "node"
+    ) -> str:
+        ext = Path(filepath).suffix.lower()
+        lang = _EXT_TO_LANG.get(ext)
+        if not lang:
+            return f"[error] unsupported extension '{ext}'"
+        extractor = _get_extractor(lang)
+        if extractor is None:
+            return f"[error] tree-sitter-{lang} not installed"
+        status, results = extractor.tick(
+            {"filepath": filepath, "query_string": query_string, "capture_name": capture_name},
+            None,
+        )
+        return f"[{status}]\n" + "\n---\n".join(results)
+
+    _splice = _ASTSplice()
+
+    def ast_splice(filepath: str, edits: list) -> str:
+        status, out = _splice.tick({"filepath": filepath, "edits": edits}, None)
+        return f"[{status}] {out}"
+
+    lsp_cmd = os.getenv("THUNK_LSP_CMD")
+    _lsp: Optional[_LSPManager] = None
+    if lsp_cmd:
+        lsp_args = os.getenv("THUNK_LSP_ARGS", "").split()
+        _lsp = _LSPManager(lsp_cmd, lsp_args)
+
+    def query_lsp(filepath: str, line: int, character: int) -> str:
+        if _lsp is None:
+            return (
+                f"[mock LSP] hover at {filepath}:{line}:{character}"
+                " — set THUNK_LSP_CMD to enable real LSP queries"
+            )
+        return _lsp.get_hover(filepath, line, character)
+
+    return {
+        "ExtractAST": extract_ast,
+        "ASTSplice": ast_splice,
+        "QueryLSP": query_lsp,
+    }
 
 # ---------------------------------------------------------------------------
 # Task schema
@@ -50,22 +148,21 @@ class TaskFile(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Tool stubs  (replace bodies with real logic as needed)
+# Mock stubs — used only when ../ariadne cannot be imported
+# Signatures match the real tool interfaces so they document the expected API.
 # ---------------------------------------------------------------------------
 
 
-def _extract_ast(file_path: str) -> str:
-    return (
-        f"[mock AST] {file_path}: Module > FunctionDef('main') > Return > Constant(0)"
-    )
+def _extract_ast(filepath: str, query_string: str, capture_name: str = "node") -> str:
+    return f"[mock AST] {filepath} query={query_string!r} capture={capture_name!r}"
 
 
-def _ast_splice(node_id: str, replacement: str) -> str:
-    return f"[mock splice] node '{node_id}' replaced with: {replacement!r}"
+def _ast_splice(filepath: str, edits: list) -> str:
+    return f"[mock splice] {filepath}: {len(edits)} edit(s) applied"
 
 
-def _query_lsp(symbol: str) -> str:
-    return f"[mock LSP] '{symbol}': defined at src/main.py:42, inferred type: str"
+def _query_lsp(filepath: str, line: int, character: int) -> str:
+    return f"[mock LSP] hover at {filepath}:{line}:{character}"
 
 
 # ---------------------------------------------------------------------------
@@ -77,16 +174,30 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "type": "function",
         "function": {
             "name": "ExtractAST",
-            "description": "Parse a source file and return its AST as a structured string.",
+            "description": (
+                "Run a tree-sitter query against a source file and return matching nodes. "
+                "Use this to extract functions, classes, imports, or any syntactic construct."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "file_path": {
+                    "filepath": {
                         "type": "string",
                         "description": "Path to the source file to parse.",
-                    }
+                    },
+                    "query_string": {
+                        "type": "string",
+                        "description": (
+                            "Tree-sitter S-expression query, e.g. "
+                            "'(function_definition name: (identifier) @node)'."
+                        ),
+                    },
+                    "capture_name": {
+                        "type": "string",
+                        "description": "Capture name to collect (default: 'node').",
+                    },
                 },
-                "required": ["file_path"],
+                "required": ["filepath", "query_string"],
             },
         },
     },
@@ -94,20 +205,32 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "type": "function",
         "function": {
             "name": "ASTSplice",
-            "description": "Replace an AST node identified by node_id with a source snippet.",
+            "description": (
+                "Apply surgical byte-range edits to a source file. "
+                "Use ExtractAST first to locate start_byte/end_byte for each target node."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "node_id": {
+                    "filepath": {
                         "type": "string",
-                        "description": "Identifier of the AST node to replace.",
+                        "description": "Path to the source file to edit.",
                     },
-                    "replacement": {
-                        "type": "string",
-                        "description": "Source code snippet to splice in.",
+                    "edits": {
+                        "type": "array",
+                        "description": "List of edits to apply, sorted bottom-up by start_byte.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "start_byte": {"type": "integer"},
+                                "end_byte": {"type": "integer"},
+                                "new_code": {"type": "string"},
+                            },
+                            "required": ["start_byte", "end_byte", "new_code"],
+                        },
                     },
                 },
-                "required": ["node_id", "replacement"],
+                "required": ["filepath", "edits"],
             },
         },
     },
@@ -115,23 +238,34 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "type": "function",
         "function": {
             "name": "QueryLSP",
-            "description": "Query the language server for hover info or definition of a symbol.",
+            "description": (
+                "Get hover information (type, docs, signature) from the language server "
+                "at a specific position in a file."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "symbol": {
+                    "filepath": {
                         "type": "string",
-                        "description": "Symbol name to look up.",
-                    }
+                        "description": "Path to the source file.",
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "0-indexed line number.",
+                    },
+                    "character": {
+                        "type": "integer",
+                        "description": "0-indexed character offset on the line.",
+                    },
                 },
-                "required": ["symbol"],
+                "required": ["filepath", "line", "character"],
             },
         },
     },
-    "Delegate_Task": {
+    "Create_Thunk": {
         "type": "function",
         "function": {
-            "name": "Delegate_Task",
+            "name": "Create_Thunk",
             "description": (
                 "Spawn a child agent to handle a sub-task. "
                 "Blocks until the child finishes and returns its result. "
@@ -156,12 +290,18 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
 }
 
-# Maps tool names to callable stubs (Delegate_Task is handled separately)
-_LOCAL_FNS: dict[str, Any] = {
-    "ExtractAST": lambda a: _extract_ast(**a),
-    "ASTSplice": lambda a: _ast_splice(**a),
-    "QueryLSP": lambda a: _query_lsp(**a),
-}
+# Maps tool names to callables (Create_Thunk is handled separately).
+# Prefer real ariadne implementations; fall back to mocks if the package is absent.
+_ext_fns = _load_tools()
+_LOCAL_FNS: dict[str, Any] = (
+    {name: (lambda a, fn=fn: fn(**a)) for name, fn in _ext_fns.items()}
+    if _ext_fns
+    else {
+        "ExtractAST": lambda a: _extract_ast(**a),
+        "ASTSplice": lambda a: _ast_splice(**a),
+        "QueryLSP": lambda a: _query_lsp(**a),
+    }
+)
 
 # ---------------------------------------------------------------------------
 # In-flight tracker — prevents double-dispatch of the same task ID
@@ -193,7 +333,7 @@ def _read_task(path: Path) -> Optional[TaskFile]:
     try:
         return TaskFile.model_validate_json(path.read_text(encoding="utf-8"))
     except (ValidationError, json.JSONDecodeError, OSError) as exc:
-        print(f"[harness] WARN: cannot read {path.name}: {exc}")
+        print(f"[thunkd] WARN: cannot read {path.name}: {exc}")
         return None
 
 
@@ -214,19 +354,19 @@ def _patch_task(path: Path, **updates: Any) -> Optional[TaskFile]:
 
 
 # ---------------------------------------------------------------------------
-# Delegate_Task interceptor
+# Create_Thunk interceptor
 # ---------------------------------------------------------------------------
 
 
-def _delegate(intent: str, tools: list[str], parent_id: str) -> str:
+def _create_thunk(intent: str, tools: list[str], parent_id: str) -> str:
     """Write a child task file and block until it reaches a terminal status."""
     child_id = f"child_{parent_id}_{uuid.uuid4().hex[:8]}"
-    child_path = ARIADNE_DIR / f"{child_id}.json"
+    child_path = THUNK_DIR / f"{child_id}.json"
     _write_task(
         TaskFile(id=child_id, intent=intent, allowed_tools=tools, status="pending"),
         child_path,
     )
-    print(f"[harness] [{parent_id}] delegated → '{child_id}': {intent!r}")
+    print(f"[thunkd] [{parent_id}] thunk created → '{child_id}': {intent!r}")
 
     while True:
         time.sleep(CHILD_POLL_INTERVAL)
@@ -236,7 +376,7 @@ def _delegate(intent: str, tools: list[str], parent_id: str) -> str:
         if child.status in ("success", "failed"):
             icon = "✓" if child.status == "success" else "✗"
             snippet = (child.result or "")[:80]
-            print(f"[harness] [{parent_id}] child '{child_id}' {icon}: {snippet!r}")
+            print(f"[thunkd] [{parent_id}] child '{child_id}' {icon}: {snippet!r}")
             return child.result or ""
 
 
@@ -276,7 +416,7 @@ def _execute(path: Path) -> None:
     if task is None:
         return
 
-    print(f"[harness] [{task.id}] starting: {task.intent!r}")
+    print(f"[thunkd] [{task.id}] starting: {task.intent!r}")
 
     schemas = [
         TOOL_SCHEMAS[name] for name in task.allowed_tools if name in TOOL_SCHEMAS
@@ -316,7 +456,7 @@ def _execute(path: Path) -> None:
             if not tool_calls:
                 final = (msg.content or "").strip()
                 _patch_task(path, status="success", result=final)
-                print(f"[harness] [{task.id}] success: {final[:80]!r}")
+                print(f"[thunkd] [{task.id}] success: {final[:80]!r}")
                 return
 
             for tc in tool_calls:
@@ -326,8 +466,8 @@ def _execute(path: Path) -> None:
                 except json.JSONDecodeError:
                     fn_args = {}
 
-                if fn_name == "Delegate_Task":
-                    result = _delegate(
+                if fn_name == "Create_Thunk":
+                    result = _create_thunk(
                         intent=fn_args.get("intent", ""),
                         tools=fn_args.get("tools", []),
                         parent_id=task.id,
@@ -341,7 +481,7 @@ def _execute(path: Path) -> None:
                     result = f"[error] unknown tool '{fn_name}'"
 
                 print(
-                    f"[harness] [{task.id}] tool {fn_name}({fn_args}) "
+                    f"[thunkd] [{task.id}] tool {fn_name}({fn_args}) "
                     f"→ {str(result)[:60]!r}"
                 )
                 messages.append(
@@ -354,8 +494,8 @@ def _execute(path: Path) -> None:
 
     except Exception as exc:
         tb = traceback.format_exc()
-        _patch_task(path, status="failed", result=f"[harness error]\n{exc}\n\n{tb}")
-        print(f"[harness] [{task.id}] FAILED: {exc}")
+        _patch_task(path, status="failed", result=f"[thunkd error]\n{exc}\n\n{tb}")
+        print(f"[thunkd] [{task.id}] FAILED: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +517,7 @@ def _worker(path: Path, task_id: str) -> None:
 
 def _find_pending() -> list[Path]:
     pending = []
-    for path in sorted(ARIADNE_DIR.glob("*.json")):
+    for path in sorted(THUNK_DIR.glob("*.json")):
         task = _read_task(path)
         if task and task.status == "pending":
             pending.append(path)
@@ -385,8 +525,10 @@ def _find_pending() -> list[Path]:
 
 
 def run() -> None:
-    ARIADNE_DIR.mkdir(exist_ok=True)
-    print(f"[harness] watching {ARIADNE_DIR.resolve()}  model={MODEL}  api_base={API_BASE}")
+    THUNK_DIR.mkdir(exist_ok=True)
+    tool_source = "ariadne package" if _ext_fns else "mock stubs"
+    print(f"[thunkd] watching {THUNK_DIR.resolve()}  model={MODEL}  api_base={API_BASE}")
+    print(f"[thunkd] tools loaded from: {tool_source}  {list(_LOCAL_FNS.keys())}")
     try:
         while True:
             for path in _find_pending():
@@ -402,7 +544,7 @@ def run() -> None:
                     ).start()
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
-        print("\n[harness] shutting down")
+        print("\n[thunkd] shutting down")
 
 
 if __name__ == "__main__":
