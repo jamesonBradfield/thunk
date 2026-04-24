@@ -44,8 +44,8 @@ THUNK_DIR = Path(".thunk")
 MODEL = os.getenv("THUNK_MODEL", "openai/local")
 API_BASE = os.getenv("THUNK_API_BASE", "http://localhost:8080/v1")
 POLL_INTERVAL = float(os.getenv("THUNK_POLL", "1.0"))
-BASH_TIMEOUT = int(os.getenv("THUNK_BASH_TIMEOUT", "60"))
-SHELL_EXE = os.getenv("THUNK_SHELL")  # e.g. "bash" or full path to git-bash
+BASH_TIMEOUT = int(os.getenv("THUNK_BASH_TIMEOUT", "120"))
+SHELL_EXE = os.getenv("THUNK_SHELL", "C:/Users/jamie/scoop/apps/msys2/current/usr/bin/bash.exe")
 
 # Tools whose presence implies the agent must do actual work.
 # If allowed but never called, the Anti-Yapping guardrail fails the task.
@@ -57,34 +57,31 @@ _MUTATING_TOOLS = frozenset({"Execute_Bash"})
 
 
 def _execute_bash(command: str) -> str:
-    """Run a shell command; raise on non-zero exit (Instant Death trigger)."""
+    """Run command via bash; raise on non-zero exit (Instant Death trigger)."""
+    if not command:
+        raise RuntimeError("Execute_Bash requires a 'command' parameter.")
     try:
-        if SHELL_EXE:
-            proc = subprocess.run(
-                [SHELL_EXE, "-c", command],
-                capture_output=True,
-                text=True,
-                timeout=BASH_TIMEOUT,
-            )
-        else:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=BASH_TIMEOUT,
-            )
+        proc = subprocess.run(
+            [SHELL_EXE, "-c", command],
+            capture_output=True,
+            text=True,
+            timeout=BASH_TIMEOUT,
+        )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"Execute_Bash: command timed out after {BASH_TIMEOUT}s: {command!r}"
-        )
+        raise RuntimeError(f"Bash command timed out after {BASH_TIMEOUT} seconds.")
+    except Exception as e:
+        raise RuntimeError(f"Execute_Bash failed: {e}")
+
+    output = proc.stdout.strip()
+
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"Execute_Bash: exit {proc.returncode}\n"
-            f"--- stderr ---\n{proc.stderr}\n"
-            f"--- stdout ---\n{proc.stdout}"
-        )
-    return proc.stdout or "(no output)"
+        error_msg = proc.stderr.strip() or output
+        raise RuntimeError(f"Bash exit code {proc.returncode}:\n{error_msg}")
+
+    if proc.stderr.strip():
+        output += f"\n--- STDERR (Warnings) ---\n{proc.stderr.strip()}"
+
+    return output or "Command executed successfully with no output."
 
 
 # ---------------------------------------------------------------------------
@@ -518,11 +515,21 @@ def _find_pending() -> list[Path]:
     return pending
 
 
+def _recover_stale_running() -> None:
+    """On startup, reset any tasks stuck at 'running' from a previous crash."""
+    for path in sorted(THUNK_DIR.glob("*.json")):
+        task = _read_task(path)
+        if task and task.status == "running":
+            _patch_task(path, status="pending")
+            print(f"[thunkd] recovered stale 'running' task '{task.id}' → pending")
+
+
 def run() -> None:
     THUNK_DIR.mkdir(exist_ok=True)
     shell_desc = SHELL_EXE or "system default"
     print(f"[thunkd] watching {THUNK_DIR.resolve()}  model={MODEL}  api_base={API_BASE}")
     print(f"[thunkd] bash worker  shell={shell_desc}  timeout={BASH_TIMEOUT}s")
+    _recover_stale_running()
     try:
         while True:
             _resume_ready_suspended()
