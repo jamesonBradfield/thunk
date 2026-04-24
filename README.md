@@ -83,3 +83,49 @@ Dispatch_Thunk(intent, target_files, allowed_tools?)
 ```
 
 Returns the worker's terse final output, or a `[FAILED]` / `[TIMEOUT]` message. The Brain never needs to know how many bash commands it took.
+
+## The Downsides
+
+1. The "Nuke" Risk (Recursive File Modification)
+
+Because Thunk workers are given Execute_Bash as their primary tool, they have the technical ability to run destructive commands across your entire project.
+
+  Irreversible Edits: A 9B model might attempt a complex sed or awk command that successfully executes (exit code 0) but fundamentally corrupts the logic or data of several files.
+
+  Scope Creep: If target_files are not strictly defined by the Brain, a worker could inadvertently modify files outside the intended refactor area.
+
+  Recursive Deletion: A hallucinated bash command could theoretically include rm -rf or other destructive operations that wipe directories before the Brain can intervene.
+
+2. The "Deadlock" and "Self-Sabotage" Loop
+
+The meta-tooling capability—where Thunk can spawn children or modify its own engine—creates a risk of logical loops.
+
+  Recursive Resource Exhaustion: Through Create_Thunk, an agent could theoretically spawn an infinite chain of sub-agents, consuming all available system memory or API credits until the THUNK_DISPATCH_TIMEOUT is reached.
+
+  Engine Tampering: Since Thunk has access to the codebase via bash, it could theoretically "fix" its own thunkd.py or mcp_server.py files in a way that disables safety guardrails or introduces backdoors.
+
+3. "Instant Death" Blind Spots
+
+The Instant Death on Tool Failure guardrail is designed to prevent hallucinations, but it can be a double-edged sword.
+
+  Lost Context: When a worker dies, the "amnesic" nature of the system means all immediate trial-and-error context in that thread is lost. If the Parent/Brain doesn't capture the stderr correctly, you can end up in a cycle where you are repeatedly killing workers without understanding the root cause of the failure.
+
+  False Successes: The "Anti-Yapping" guardrail only triggers if no tools are called. If a model calls a non-mutating tool (like ls) and then declares victory without actually performing the requested edit, the system might mark it as a success, leading to "silent failures" where the Brain thinks work was done when it wasn't.
+
+4. Hardware and Environment Vulnerability
+
+The architecture relies on the local environment being "UNIX-like," which creates friction on Windows systems.
+
+  Shell Injection: While thunkd.py is hardwired to MSYS2 bash to prevent cmd.exe collisions, the system essentially executes raw strings from an LLM directly into your shell. A malicious or highly confused model could execute unintended system-level commands.
+
+  VRAM/System Instability: Running 30B+ models alongside high-context 9B workers pushes consumer hardware (like your 7700 XT and 5600G) to its thermal and memory limits. If the thermal limits are pushed too far (the "microwave" scenario), it could lead to system crashes or hardware degradation.
+
+Recommended Mitigations
+
+To minimize these dangers, the "Pristine Working Tree" Protocol is critical:
+
+  Mandatory Git Checkpoints: Never run Thunk on an uncommitted working tree. The Brain must be able to run git restore . the moment a Thunk task results in a "success" that actually broke functionality.
+
+  Restricted Bash Environment: Running the daemon inside a container or a restricted VM would prevent a "hallucinated bash" from touching sensitive system files outside the project directory.
+
+  Stricter Intent Validation: The Brain (the larger, more capable model) must act as a ruthless "Lead Maintainer," verifying the git diff of every Thunk completion before it is committed.
