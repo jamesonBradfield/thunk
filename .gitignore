@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Claude Code project-local config
+.claude/
+
+# Thunk runtime queue — session task files, not source
+.thunk/

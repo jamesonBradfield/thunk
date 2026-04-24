@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
-"""thunkd.py — Headless, file-based AI agent daemon.
+"""thunkd.py — Headless automaton: the v4 bash-worker harness.
 
-Environment variables:
+The LLM is a stateless CPU. State lives on disk as JSON task files.
+Workers are bash-wielding grunts: they explore, modify, and validate via Execute_Bash.
+
+Three invariants:
+  1. True Amnesia       — no chat logs across runs; each task is a single static prompt.
+  2. Dependency Injection — only the exact `allowed_tools` are wired up per task.
+  3. Illusion of Self-Execution — Create_Thunk spawns children via suspend/resume,
+     so the parent's thread dies while the child runs.
+
+Environment:
   THUNK_MODEL        LiteLLM model string (default: openai/local)
   THUNK_API_BASE     Base URL for the LLM API (default: http://localhost:8080/v1)
   THUNK_POLL         Watcher poll interval in seconds (default: 1.0)
-  THUNK_CHILD_POLL   Child-task poll interval in seconds (default: 0.5)
   OPENAI_API_KEY     API key — not required for llama-server (uses dummy value)
-  THUNK_LSP_CMD      Executable for the LSP-MCP server (optional; enables real QueryLSP)
-  THUNK_LSP_ARGS     Space-separated args for the LSP-MCP server (optional)
+  THUNK_SHELL        Shell executable for Execute_Bash (default: system shell)
+  THUNK_BASH_TIMEOUT Per-command timeout in seconds (default: 60)
 
-Drop a JSON file into .thunk/ with this shape and the daemon picks it up:
-  {"id": "task_1", "intent": "...", "allowed_tools": [...], "status": "pending"}
+Drop a JSON file into .thunk/ matching the TaskFile schema to dispatch a task.
 """
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
-import sys
+import subprocess
 import threading
 import time
 import traceback
@@ -38,101 +44,45 @@ THUNK_DIR = Path(".thunk")
 MODEL = os.getenv("THUNK_MODEL", "openai/local")
 API_BASE = os.getenv("THUNK_API_BASE", "http://localhost:8080/v1")
 POLL_INTERVAL = float(os.getenv("THUNK_POLL", "1.0"))
-CHILD_POLL_INTERVAL = float(os.getenv("THUNK_CHILD_POLL", "0.5"))
+BASH_TIMEOUT = int(os.getenv("THUNK_BASH_TIMEOUT", "120"))
+SHELL_EXE = os.getenv("THUNK_SHELL", "C:/Users/jamie/scoop/apps/msys2/current/usr/bin/bash.exe")
+
+# Tools whose presence implies the agent must do actual work.
+# If allowed but never called, the Anti-Yapping guardrail fails the task.
+_MUTATING_TOOLS = frozenset({"Execute_Bash"})
 
 # ---------------------------------------------------------------------------
-# Tool loader
+# Execute_Bash implementation
 # ---------------------------------------------------------------------------
 
-_EXT_TO_LANG: dict[str, str] = {
-    ".py": "python",
-    ".rs": "rust",
-    ".js": "javascript",
-    ".ts": "typescript",
-    ".go": "go",
-    ".c": "c",
-    ".cpp": "cpp",
-}
 
-
-def _load_tools() -> dict[str, Any]:
-    """Import ../ariadne primitives and return a name→callable map.
-
-    Returns an empty dict (triggering mock fallback) if the package is absent
-    or any required dependency is missing.
-    """
-    ariadne_root = Path(__file__).resolve().parent.parent / "ariadne"
-    if not ariadne_root.exists():
-        return {}
-    pkg_dir = str(ariadne_root)
-    if pkg_dir not in sys.path:
-        sys.path.insert(0, pkg_dir)
-
+def _execute_bash(command: str) -> str:
+    """Run command via bash; raise on non-zero exit (Instant Death trigger)."""
+    if not command:
+        raise RuntimeError("Execute_Bash requires a 'command' parameter.")
     try:
-        from ariadne.primitives import ASTSplice as _ASTSplice
-        from ariadne.primitives import ExtractAST as _ExtractAST
-        from ariadne.lsp import LSPManager as _LSPManager
-    except ImportError as exc:
-        print(f"[thunkd] WARN: ariadne import failed — {exc}")
-        return {}
-
-    # Cache ExtractAST instances by language (parser init is expensive)
-    _ast_cache: dict[str, _ExtractAST] = {}
-
-    def _get_extractor(lang: str) -> Optional[_ExtractAST]:
-        if lang in _ast_cache:
-            return _ast_cache[lang]
-        try:
-            pkg = importlib.import_module(f"tree_sitter_{lang}")
-            lang_ptr = pkg.language() if hasattr(pkg, "language") else getattr(pkg, lang)()
-            inst = _ExtractAST(lang_ptr)
-            _ast_cache[lang] = inst
-            return inst
-        except Exception as exc:
-            print(f"[thunkd] WARN: cannot load tree-sitter-{lang}: {exc}")
-            return None
-
-    def extract_ast(
-        filepath: str, query_string: str, capture_name: str = "node"
-    ) -> str:
-        ext = Path(filepath).suffix.lower()
-        lang = _EXT_TO_LANG.get(ext)
-        if not lang:
-            return f"[error] unsupported extension '{ext}'"
-        extractor = _get_extractor(lang)
-        if extractor is None:
-            return f"[error] tree-sitter-{lang} not installed"
-        status, results = extractor.tick(
-            {"filepath": filepath, "query_string": query_string, "capture_name": capture_name},
-            None,
+        proc = subprocess.run(
+            [SHELL_EXE, "-c", command],
+            capture_output=True,
+            text=True,
+            timeout=BASH_TIMEOUT,
         )
-        return f"[{status}]\n" + "\n---\n".join(results)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Bash command timed out after {BASH_TIMEOUT} seconds.")
+    except Exception as e:
+        raise RuntimeError(f"Execute_Bash failed: {e}")
 
-    _splice = _ASTSplice()
+    output = proc.stdout.strip()
 
-    def ast_splice(filepath: str, edits: list) -> str:
-        status, out = _splice.tick({"filepath": filepath, "edits": edits}, None)
-        return f"[{status}] {out}"
+    if proc.returncode != 0:
+        error_msg = proc.stderr.strip() or output
+        raise RuntimeError(f"Bash exit code {proc.returncode}:\n{error_msg}")
 
-    lsp_cmd = os.getenv("THUNK_LSP_CMD")
-    _lsp: Optional[_LSPManager] = None
-    if lsp_cmd:
-        lsp_args = os.getenv("THUNK_LSP_ARGS", "").split()
-        _lsp = _LSPManager(lsp_cmd, lsp_args)
+    if proc.stderr.strip():
+        output += f"\n--- STDERR (Warnings) ---\n{proc.stderr.strip()}"
 
-    def query_lsp(filepath: str, line: int, character: int) -> str:
-        if _lsp is None:
-            return (
-                f"[mock LSP] hover at {filepath}:{line}:{character}"
-                " — set THUNK_LSP_CMD to enable real LSP queries"
-            )
-        return _lsp.get_hover(filepath, line, character)
+    return output or "Command executed successfully with no output."
 
-    return {
-        "ExtractAST": extract_ast,
-        "ASTSplice": ast_splice,
-        "QueryLSP": query_lsp,
-    }
 
 # ---------------------------------------------------------------------------
 # Task schema
@@ -142,27 +92,16 @@ def _load_tools() -> dict[str, Any]:
 class TaskFile(BaseModel):
     id: str
     intent: str
+    target_files: list[str] = []
+    parent_context: Optional[str] = None
+    parent_id: Optional[str] = None
     allowed_tools: list[str]
-    status: Literal["pending", "running", "success", "failed"]
+    status: Literal["pending", "running", "suspended", "success", "failed"]
     result: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Mock stubs — used only when ../ariadne cannot be imported
-# Signatures match the real tool interfaces so they document the expected API.
-# ---------------------------------------------------------------------------
-
-
-def _extract_ast(filepath: str, query_string: str, capture_name: str = "node") -> str:
-    return f"[mock AST] {filepath} query={query_string!r} capture={capture_name!r}"
-
-
-def _ast_splice(filepath: str, edits: list) -> str:
-    return f"[mock splice] {filepath}: {len(edits)} edit(s) applied"
-
-
-def _query_lsp(filepath: str, line: int, character: int) -> str:
-    return f"[mock LSP] hover at {filepath}:{line}:{character}"
+    # Suspended-queue state: the conversation tape and the child we're awaiting.
+    messages: Optional[list[dict[str, Any]]] = None
+    pending_child_id: Optional[str] = None
+    pending_tool_call_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -170,95 +109,26 @@ def _query_lsp(filepath: str, line: int, character: int) -> str:
 # ---------------------------------------------------------------------------
 
 TOOL_SCHEMAS: dict[str, dict] = {
-    "ExtractAST": {
+    "Execute_Bash": {
         "type": "function",
         "function": {
-            "name": "ExtractAST",
+            "name": "Execute_Bash",
             "description": (
-                "Run a tree-sitter query against a source file and return matching nodes. "
-                "Use this to extract functions, classes, imports, or any syntactic construct."
+                "Execute a shell command and return its stdout. "
+                "Use for exploration (cat, grep, find, ls), "
+                "modification (sed, awk, patch, writing files), "
+                "and validation (pytest, flake8, npm run build). "
+                "A non-zero exit code terminates the task immediately — no retries."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filepath": {
+                    "command": {
                         "type": "string",
-                        "description": "Path to the source file to parse.",
-                    },
-                    "query_string": {
-                        "type": "string",
-                        "description": (
-                            "Tree-sitter S-expression query, e.g. "
-                            "'(function_definition name: (identifier) @node)'."
-                        ),
-                    },
-                    "capture_name": {
-                        "type": "string",
-                        "description": "Capture name to collect (default: 'node').",
+                        "description": "The shell command to execute.",
                     },
                 },
-                "required": ["filepath", "query_string"],
-            },
-        },
-    },
-    "ASTSplice": {
-        "type": "function",
-        "function": {
-            "name": "ASTSplice",
-            "description": (
-                "Apply surgical byte-range edits to a source file. "
-                "Use ExtractAST first to locate start_byte/end_byte for each target node."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "Path to the source file to edit.",
-                    },
-                    "edits": {
-                        "type": "array",
-                        "description": "List of edits to apply, sorted bottom-up by start_byte.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start_byte": {"type": "integer"},
-                                "end_byte": {"type": "integer"},
-                                "new_code": {"type": "string"},
-                            },
-                            "required": ["start_byte", "end_byte", "new_code"],
-                        },
-                    },
-                },
-                "required": ["filepath", "edits"],
-            },
-        },
-    },
-    "QueryLSP": {
-        "type": "function",
-        "function": {
-            "name": "QueryLSP",
-            "description": (
-                "Get hover information (type, docs, signature) from the language server "
-                "at a specific position in a file."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "Path to the source file.",
-                    },
-                    "line": {
-                        "type": "integer",
-                        "description": "0-indexed line number.",
-                    },
-                    "character": {
-                        "type": "integer",
-                        "description": "0-indexed character offset on the line.",
-                    },
-                },
-                "required": ["filepath", "line", "character"],
+                "required": ["command"],
             },
         },
     },
@@ -267,16 +137,27 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "function": {
             "name": "Create_Thunk",
             "description": (
-                "Spawn a child agent to handle a sub-task. "
-                "Blocks until the child finishes and returns its result. "
-                "Use this to decompose complex work into isolated sub-agents."
+                "Spawn a child agent to handle a sub-task with perfect situational awareness. "
+                "The child runs in isolation; you receive its final output as this tool's return value."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "intent": {
                         "type": "string",
-                        "description": "The goal for the child agent to achieve.",
+                        "description": "The immediate atomic goal for the child agent.",
+                    },
+                    "target_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Explicit file boundaries for the child. No guessing allowed.",
+                    },
+                    "parent_context": {
+                        "type": "string",
+                        "description": (
+                            "Crucial constraints the child must know "
+                            "(e.g. 'I already tried X, do Y instead')."
+                        ),
                     },
                     "tools": {
                         "type": "array",
@@ -284,24 +165,15 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "description": "Tool names the child agent is allowed to use.",
                     },
                 },
-                "required": ["intent", "tools"],
+                "required": ["intent", "target_files", "parent_context", "tools"],
             },
         },
     },
 }
 
-# Maps tool names to callables (Create_Thunk is handled separately).
-# Prefer real ariadne implementations; fall back to mocks if the package is absent.
-_ext_fns = _load_tools()
-_LOCAL_FNS: dict[str, Any] = (
-    {name: (lambda a, fn=fn: fn(**a)) for name, fn in _ext_fns.items()}
-    if _ext_fns
-    else {
-        "ExtractAST": lambda a: _extract_ast(**a),
-        "ASTSplice": lambda a: _ast_splice(**a),
-        "QueryLSP": lambda a: _query_lsp(**a),
-    }
-)
+_LOCAL_FNS: dict[str, Any] = {
+    "Execute_Bash": lambda a: _execute_bash(**a),
+}
 
 # ---------------------------------------------------------------------------
 # In-flight tracker — prevents double-dispatch of the same task ID
@@ -332,13 +204,12 @@ def _release(task_id: str) -> None:
 def _read_task(path: Path) -> Optional[TaskFile]:
     try:
         return TaskFile.model_validate_json(path.read_text(encoding="utf-8"))
-    except (ValidationError, json.JSONDecodeError, OSError) as exc:
+    except (ValidationError, Exception) as exc:
         print(f"[thunkd] WARN: cannot read {path.name}: {exc}")
         return None
 
 
 def _write_task(task: TaskFile, path: Path) -> None:
-    # Write to a sibling .tmp then rename so readers never see a partial file
     tmp = path.with_suffix(".tmp")
     tmp.write_text(task.model_dump_json(indent=2), encoding="utf-8")
     tmp.replace(path)
@@ -354,30 +225,51 @@ def _patch_task(path: Path, **updates: Any) -> Optional[TaskFile]:
 
 
 # ---------------------------------------------------------------------------
-# Create_Thunk interceptor
+# Create_Thunk interceptor — writes child, raises to suspend parent
 # ---------------------------------------------------------------------------
 
 
-def _create_thunk(intent: str, tools: list[str], parent_id: str) -> str:
-    """Write a child task file and block until it reaches a terminal status."""
+class _SuspendTask(Exception):
+    """Unwind out of the worker loop to park the task as suspended."""
+
+    def __init__(self, child_id: str, tool_call_id: str) -> None:
+        self.child_id = child_id
+        self.tool_call_id = tool_call_id
+
+
+def _spawn_child(
+    *,
+    intent: str,
+    target_files: list[str],
+    parent_context: str,
+    tools: list[str],
+    parent_id: str,
+    tool_call_id: str,
+) -> None:
+    """Write a new child task file; raise to suspend the parent thread."""
+    if not target_files:
+        raise RuntimeError("Create_Thunk: target_files must be a non-empty array")
+    if not parent_context or not parent_context.strip():
+        raise RuntimeError("Create_Thunk: parent_context is required")
+    if not tools:
+        raise RuntimeError("Create_Thunk: tools must be a non-empty array")
+
     child_id = f"child_{parent_id}_{uuid.uuid4().hex[:8]}"
     child_path = THUNK_DIR / f"{child_id}.json"
     _write_task(
-        TaskFile(id=child_id, intent=intent, allowed_tools=tools, status="pending"),
+        TaskFile(
+            id=child_id,
+            intent=intent,
+            target_files=target_files,
+            parent_context=parent_context,
+            parent_id=parent_id,
+            allowed_tools=tools,
+            status="pending",
+        ),
         child_path,
     )
-    print(f"[thunkd] [{parent_id}] thunk created → '{child_id}': {intent!r}")
-
-    while True:
-        time.sleep(CHILD_POLL_INTERVAL)
-        child = _read_task(child_path)
-        if child is None:
-            return "[error] child task file disappeared before completion"
-        if child.status in ("success", "failed"):
-            icon = "✓" if child.status == "success" else "✗"
-            snippet = (child.result or "")[:80]
-            print(f"[thunkd] [{parent_id}] child '{child_id}' {icon}: {snippet!r}")
-            return child.result or ""
+    print(f"[thunkd] [{parent_id}] spawned '{child_id}': {intent!r}")
+    raise _SuspendTask(child_id=child_id, tool_call_id=tool_call_id)
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +278,6 @@ def _create_thunk(intent: str, tools: list[str], parent_id: str) -> str:
 
 
 def _msg_to_dict(msg: Any) -> dict:
-    """Flatten a LiteLLM Message object into a plain dict for the messages list."""
     d: dict[str, Any] = {"role": msg.role}
     if msg.content is not None:
         d["content"] = msg.content
@@ -406,6 +297,34 @@ def _msg_to_dict(msg: Any) -> dict:
     return d
 
 
+def _build_initial_messages(task: TaskFile) -> list[dict]:
+    """Construct the single static prompt for a fresh (non-resumed) task."""
+    lines = [f"Intent: {task.intent}"]
+    if task.target_files:
+        lines.append("Target files:")
+        lines.extend(f"  - {f}" for f in task.target_files)
+    else:
+        lines.append("Target files: (none specified)")
+    if task.parent_context:
+        lines.append("")
+        lines.append(f"Parent context: {task.parent_context}")
+
+    system = (
+        "You are an isolated, stateless bash worker. "
+        "Use Execute_Bash to explore the codebase (cat, grep, find, ls), "
+        "modify files (sed, awk, patch, or write via shell redirection), "
+        "and validate your work (pytest, flake8, npm run build). "
+        "You have no memory of prior conversations. "
+        "A failed command (non-zero exit) terminates you immediately — "
+        "check your syntax before running. "
+        "When the task is complete, reply with a terse final answer."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
@@ -416,25 +335,16 @@ def _execute(path: Path) -> None:
     if task is None:
         return
 
-    print(f"[thunkd] [{task.id}] starting: {task.intent!r}")
+    resumed = task.messages is not None
+    print(
+        f"[thunkd] [{task.id}] {'resuming' if resumed else 'starting'}: {task.intent!r}"
+    )
 
     schemas = [
         TOOL_SCHEMAS[name] for name in task.allowed_tools if name in TOOL_SCHEMAS
     ]
-
-    messages: list[dict] = [
-        {
-            "role": "system",
-            "content": (
-                "You are an isolated, stateless worker. "
-                "Use your tools to achieve the intent, then reply with your final answer as plain text."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Achieve this intent: {task.intent}",
-        },
-    ]
+    messages: list[dict] = list(task.messages) if resumed else _build_initial_messages(task)
+    called_tool_names: set[str] = set()
 
     try:
         while True:
@@ -453,32 +363,62 @@ def _execute(path: Path) -> None:
             messages.append(_msg_to_dict(msg))
 
             tool_calls = getattr(msg, "tool_calls", None) or []
+
             if not tool_calls:
                 final = (msg.content or "").strip()
+                # Anti-Yapping: if agent was given a mutating tool and never called one, fail.
+                mutating_allowed = set(task.allowed_tools) & _MUTATING_TOOLS
+                if mutating_allowed and not (called_tool_names & _MUTATING_TOOLS):
+                    err = (
+                        "[Harness Error] Agent declared completion without "
+                        f"ever calling its tools (allowed: {sorted(mutating_allowed)})."
+                    )
+                    _patch_task(path, status="failed", result=err)
+                    print(f"[thunkd] [{task.id}] FAILED (anti-yap): {err}")
+                    return
                 _patch_task(path, status="success", result=final)
                 print(f"[thunkd] [{task.id}] success: {final[:80]!r}")
                 return
 
             for tc in tool_calls:
                 fn_name = tc.function.name
+                called_tool_names.add(fn_name)
                 try:
                     fn_args: dict = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    fn_args = {}
+                except json.JSONDecodeError as exc:
+                    # Instant death: bad JSON in tool call, no retry.
+                    err = f"[Harness Error] malformed JSON in tool '{fn_name}' call: {exc}"
+                    _patch_task(path, status="failed", result=err)
+                    print(f"[thunkd] [{task.id}] FAILED (bad JSON): {err}")
+                    return
 
                 if fn_name == "Create_Thunk":
-                    result = _create_thunk(
+                    # Raises _SuspendTask on success, RuntimeError on bad args.
+                    _spawn_child(
                         intent=fn_args.get("intent", ""),
+                        target_files=fn_args.get("target_files", []),
+                        parent_context=fn_args.get("parent_context", ""),
                         tools=fn_args.get("tools", []),
                         parent_id=task.id,
+                        tool_call_id=tc.id,
                     )
-                elif fn_name in _LOCAL_FNS:
-                    try:
-                        result = _LOCAL_FNS[fn_name](fn_args)
-                    except Exception as exc:
-                        result = f"[tool error] {fn_name}: {exc}"
-                else:
-                    result = f"[error] unknown tool '{fn_name}'"
+                    # unreachable
+                    return
+
+                if fn_name not in _LOCAL_FNS:
+                    err = f"[Harness Error] unknown tool '{fn_name}'"
+                    _patch_task(path, status="failed", result=err)
+                    print(f"[thunkd] [{task.id}] FAILED (unknown tool): {err}")
+                    return
+
+                try:
+                    result = _LOCAL_FNS[fn_name](fn_args)
+                except Exception as exc:
+                    # Instant Death on Tool Failure — do not feed the error back.
+                    err = f"[Harness Error] tool '{fn_name}' raised: {exc}"
+                    _patch_task(path, status="failed", result=err)
+                    print(f"[thunkd] [{task.id}] FAILED (tool error): {err}")
+                    return
 
                 print(
                     f"[thunkd] [{task.id}] tool {fn_name}({fn_args}) "
@@ -491,6 +431,17 @@ def _execute(path: Path) -> None:
                         "content": str(result),
                     }
                 )
+
+    except _SuspendTask as sus:
+        _patch_task(
+            path,
+            status="suspended",
+            messages=messages,
+            pending_child_id=sus.child_id,
+            pending_tool_call_id=sus.tool_call_id,
+        )
+        print(f"[thunkd] [{task.id}] suspended → awaiting '{sus.child_id}'")
+        return
 
     except Exception as exc:
         tb = traceback.format_exc()
@@ -515,6 +466,46 @@ def _worker(path: Path, task_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resume_ready_suspended() -> None:
+    """Wake any suspended parent whose awaited child has reached a terminal state."""
+    for path in sorted(THUNK_DIR.glob("*.json")):
+        parent = _read_task(path)
+        if parent is None or parent.status != "suspended":
+            continue
+        if not parent.pending_child_id:
+            continue
+
+        child_path = THUNK_DIR / f"{parent.pending_child_id}.json"
+        child = _read_task(child_path)
+        if child is None or child.status not in ("success", "failed"):
+            continue
+
+        child_output = child.result or ""
+        injected = (
+            f"[child failed] {child_output}"
+            if child.status == "failed"
+            else child_output
+        )
+        messages = list(parent.messages or [])
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": parent.pending_tool_call_id or "",
+                "content": injected,
+            }
+        )
+        _patch_task(
+            path,
+            status="pending",
+            messages=messages,
+            pending_child_id=None,
+            pending_tool_call_id=None,
+        )
+        print(
+            f"[thunkd] [{parent.id}] resumed (child '{parent.pending_child_id}' {child.status})"
+        )
+
+
 def _find_pending() -> list[Path]:
     pending = []
     for path in sorted(THUNK_DIR.glob("*.json")):
@@ -524,16 +515,26 @@ def _find_pending() -> list[Path]:
     return pending
 
 
+def _recover_stale_running() -> None:
+    """On startup, reset any tasks stuck at 'running' from a previous crash."""
+    for path in sorted(THUNK_DIR.glob("*.json")):
+        task = _read_task(path)
+        if task and task.status == "running":
+            _patch_task(path, status="pending")
+            print(f"[thunkd] recovered stale 'running' task '{task.id}' → pending")
+
+
 def run() -> None:
     THUNK_DIR.mkdir(exist_ok=True)
-    tool_source = "ariadne package" if _ext_fns else "mock stubs"
+    shell_desc = SHELL_EXE or "system default"
     print(f"[thunkd] watching {THUNK_DIR.resolve()}  model={MODEL}  api_base={API_BASE}")
-    print(f"[thunkd] tools loaded from: {tool_source}  {list(_LOCAL_FNS.keys())}")
+    print(f"[thunkd] bash worker  shell={shell_desc}  timeout={BASH_TIMEOUT}s")
+    _recover_stale_running()
     try:
         while True:
+            _resume_ready_suspended()
             for path in _find_pending():
                 task = _read_task(path)
-                # Re-read status: another thread may have claimed it since _find_pending
                 if task is None or task.status != "pending":
                     continue
                 if _claim(task.id):
