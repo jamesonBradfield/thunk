@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""thunkd.py — Headless automaton: the v3 suspended-queue harness.
+"""thunkd.py — Headless automaton: the v4 bash-worker harness.
 
 The LLM is a stateless CPU. State lives on disk as JSON task files.
+Workers are bash-wielding grunts: they explore, modify, and validate via Execute_Bash.
 
 Three invariants:
   1. True Amnesia       — no chat logs across runs; each task is a single static prompt.
@@ -14,18 +15,17 @@ Environment:
   THUNK_API_BASE     Base URL for the LLM API (default: http://localhost:8080/v1)
   THUNK_POLL         Watcher poll interval in seconds (default: 1.0)
   OPENAI_API_KEY     API key — not required for llama-server (uses dummy value)
-  THUNK_LSP_CMD      Executable for the LSP-MCP server (optional; enables real QueryLSP)
-  THUNK_LSP_ARGS     Space-separated args for the LSP-MCP server (optional)
+  THUNK_SHELL        Shell executable for Execute_Bash (default: system shell)
+  THUNK_BASH_TIMEOUT Per-command timeout in seconds (default: 60)
 
 Drop a JSON file into .thunk/ matching the TaskFile schema to dispatch a task.
 """
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
-import sys
+import subprocess
 import threading
 import time
 import traceback
@@ -44,140 +44,47 @@ THUNK_DIR = Path(".thunk")
 MODEL = os.getenv("THUNK_MODEL", "openai/local")
 API_BASE = os.getenv("THUNK_API_BASE", "http://localhost:8080/v1")
 POLL_INTERVAL = float(os.getenv("THUNK_POLL", "1.0"))
+BASH_TIMEOUT = int(os.getenv("THUNK_BASH_TIMEOUT", "60"))
+SHELL_EXE = os.getenv("THUNK_SHELL")  # e.g. "bash" or full path to git-bash
 
-# Tools whose presence implies the agent must mutate state. If allowed but
-# never called, the Anti-Yapping guardrail fails the task.
-_MUTATING_TOOLS = frozenset({"ASTSplice"})
+# Tools whose presence implies the agent must do actual work.
+# If allowed but never called, the Anti-Yapping guardrail fails the task.
+_MUTATING_TOOLS = frozenset({"Execute_Bash"})
 
 # ---------------------------------------------------------------------------
-# Tool loader
+# Execute_Bash implementation
 # ---------------------------------------------------------------------------
 
-_EXT_TO_LANG: dict[str, str] = {
-    ".py": "python",
-    ".rs": "rust",
-    ".js": "javascript",
-    ".ts": "typescript",
-    ".go": "go",
-    ".c": "c",
-    ".cpp": "cpp",
-}
 
-
-def _load_tools() -> dict[str, Any]:
-    """Import ../ariadne primitives and return a name→callable map.
-
-    Wrappers raise on tool failure so the harness can fail fast (v3 guardrail:
-    Instant Death on Tool Failure — no retries, no error feedback to the LLM).
-    """
-    ariadne_root = Path(__file__).resolve().parent.parent / "ariadne"
-    if not ariadne_root.exists():
-        return {}
-    pkg_dir = str(ariadne_root)
-    if pkg_dir not in sys.path:
-        sys.path.insert(0, pkg_dir)
-
+def _execute_bash(command: str) -> str:
+    """Run a shell command; raise on non-zero exit (Instant Death trigger)."""
     try:
-        from ariadne.primitives import ASTSplice as _ASTSplice
-        from ariadne.primitives import ExtractAST as _ExtractAST
-    except ImportError as exc:
-        print(f"[thunkd] WARN: ariadne primitives import failed — {exc}")
-        return {}
-
-    # LSP is optional and pulls in the `mcp` stack; tolerate its absence
-    # rather than failing over to mocks for all tools.
-    _LSPManager: Optional[Any] = None
-    try:
-        from ariadne.lsp import LSPManager as _LSPManager  # type: ignore[no-redef]
-    except ImportError as exc:
-        print(f"[thunkd] WARN: ariadne.lsp unavailable ({exc}) — QueryLSP disabled")
-
-    _ast_cache: dict[str, _ExtractAST] = {}
-
-    def _get_extractor(lang: str) -> Optional[_ExtractAST]:
-        if lang in _ast_cache:
-            return _ast_cache[lang]
-        try:
-            pkg = importlib.import_module(f"tree_sitter_{lang}")
-            lang_ptr = pkg.language() if hasattr(pkg, "language") else getattr(pkg, lang)()
-            inst = _ExtractAST(lang_ptr)
-            _ast_cache[lang] = inst
-            return inst
-        except Exception as exc:
-            print(f"[thunkd] WARN: cannot load tree-sitter-{lang}: {exc}")
-            return None
-
-    def extract_ast(
-        filepath: str, query_string: str, capture_name: str = "node"
-    ) -> str:
-        ext = Path(filepath).suffix.lower()
-        lang = _EXT_TO_LANG.get(ext)
-        if not lang:
-            raise RuntimeError(f"ExtractAST: unsupported extension '{ext}'")
-        extractor = _get_extractor(lang)
-        if extractor is None:
-            raise RuntimeError(f"ExtractAST: tree-sitter-{lang} not installed")
-        status, results = extractor.tick(
-            {"filepath": filepath, "query_string": query_string, "capture_name": capture_name},
-            None,
+        if SHELL_EXE:
+            proc = subprocess.run(
+                [SHELL_EXE, "-c", command],
+                capture_output=True,
+                text=True,
+                timeout=BASH_TIMEOUT,
+            )
+        else:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=BASH_TIMEOUT,
+            )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Execute_Bash: command timed out after {BASH_TIMEOUT}s: {command!r}"
         )
-        # Ariadne statuses: "SUCCESS" (matches), "NOT_FOUND" (zero matches — benign), "ERROR".
-        if status == "SUCCESS":
-            return "\n---\n".join(results)
-        if status == "NOT_FOUND":
-            return ""
-        raise RuntimeError(f"ExtractAST {status}: {' | '.join(results)}")
-
-    _splice = _ASTSplice()
-
-    def ast_splice(filepath: str, edits: list) -> str:
-        status, out = _splice.tick({"filepath": filepath, "edits": edits}, None)
-        # Ariadne statuses: "SUCCESS" (returns filepath), "REJECTED" (markdown fences), "ERROR".
-        if status == "SUCCESS":
-            return str(out)
-        raise RuntimeError(f"ASTSplice {status}: {out}")
-
-    tools: dict[str, Any] = {
-        "ExtractAST": extract_ast,
-        "ASTSplice": ast_splice,
-    }
-
-    lsp_cmd = os.getenv("THUNK_LSP_CMD")
-    if _LSPManager is not None:
-        _lsp = _LSPManager(lsp_cmd, os.getenv("THUNK_LSP_ARGS", "").split()) if lsp_cmd else None
-
-        def query_lsp(filepath: str, line: int, character: int) -> str:
-            if _lsp is None:
-                return (
-                    f"[mock LSP] hover at {filepath}:{line}:{character}"
-                    " — set THUNK_LSP_CMD to enable real LSP queries"
-                )
-            return _lsp.get_hover(filepath, line, character)
-
-        tools["QueryLSP"] = query_lsp
-    else:
-        tools["QueryLSP"] = lambda filepath, line, character: (
-            f"[mock LSP] hover at {filepath}:{line}:{character} — ariadne.lsp unavailable"
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Execute_Bash: exit {proc.returncode}\n"
+            f"--- stderr ---\n{proc.stderr}\n"
+            f"--- stdout ---\n{proc.stdout}"
         )
-
-    return tools
-
-
-# ---------------------------------------------------------------------------
-# Mock stubs — used only when ../ariadne cannot be imported
-# ---------------------------------------------------------------------------
-
-
-def _extract_ast(filepath: str, query_string: str, capture_name: str = "node") -> str:
-    return f"[mock AST] {filepath} query={query_string!r} capture={capture_name!r}"
-
-
-def _ast_splice(filepath: str, edits: list) -> str:
-    return f"[mock splice] {filepath}: {len(edits)} edit(s) applied"
-
-
-def _query_lsp(filepath: str, line: int, character: int) -> str:
-    return f"[mock LSP] hover at {filepath}:{line}:{character}"
+    return proc.stdout or "(no output)"
 
 
 # ---------------------------------------------------------------------------
@@ -205,95 +112,26 @@ class TaskFile(BaseModel):
 # ---------------------------------------------------------------------------
 
 TOOL_SCHEMAS: dict[str, dict] = {
-    "ExtractAST": {
+    "Execute_Bash": {
         "type": "function",
         "function": {
-            "name": "ExtractAST",
+            "name": "Execute_Bash",
             "description": (
-                "Run a tree-sitter query against a source file and return matching nodes. "
-                "Use this to extract functions, classes, imports, or any syntactic construct."
+                "Execute a shell command and return its stdout. "
+                "Use for exploration (cat, grep, find, ls), "
+                "modification (sed, awk, patch, writing files), "
+                "and validation (pytest, flake8, npm run build). "
+                "A non-zero exit code terminates the task immediately — no retries."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filepath": {
+                    "command": {
                         "type": "string",
-                        "description": "Path to the source file to parse.",
-                    },
-                    "query_string": {
-                        "type": "string",
-                        "description": (
-                            "Tree-sitter S-expression query, e.g. "
-                            "'(function_definition name: (identifier) @node)'."
-                        ),
-                    },
-                    "capture_name": {
-                        "type": "string",
-                        "description": "Capture name to collect (default: 'node').",
+                        "description": "The shell command to execute.",
                     },
                 },
-                "required": ["filepath", "query_string"],
-            },
-        },
-    },
-    "ASTSplice": {
-        "type": "function",
-        "function": {
-            "name": "ASTSplice",
-            "description": (
-                "Apply surgical byte-range edits to a source file. "
-                "Use ExtractAST first to locate start_byte/end_byte for each target node."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "Path to the source file to edit.",
-                    },
-                    "edits": {
-                        "type": "array",
-                        "description": "List of edits to apply, sorted bottom-up by start_byte.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "start_byte": {"type": "integer"},
-                                "end_byte": {"type": "integer"},
-                                "new_code": {"type": "string"},
-                            },
-                            "required": ["start_byte", "end_byte", "new_code"],
-                        },
-                    },
-                },
-                "required": ["filepath", "edits"],
-            },
-        },
-    },
-    "QueryLSP": {
-        "type": "function",
-        "function": {
-            "name": "QueryLSP",
-            "description": (
-                "Get hover information (type, docs, signature) from the language server "
-                "at a specific position in a file."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "Path to the source file.",
-                    },
-                    "line": {
-                        "type": "integer",
-                        "description": "0-indexed line number.",
-                    },
-                    "character": {
-                        "type": "integer",
-                        "description": "0-indexed character offset on the line.",
-                    },
-                },
-                "required": ["filepath", "line", "character"],
+                "required": ["command"],
             },
         },
     },
@@ -320,7 +158,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
                     "parent_context": {
                         "type": "string",
                         "description": (
-                            "Crucial constraints the child must know (e.g. 'I already tried X, do Y instead')."
+                            "Crucial constraints the child must know "
+                            "(e.g. 'I already tried X, do Y instead')."
                         ),
                     },
                     "tools": {
@@ -335,16 +174,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
 }
 
-_ext_fns = _load_tools()
-_LOCAL_FNS: dict[str, Any] = (
-    {name: (lambda a, fn=fn: fn(**a)) for name, fn in _ext_fns.items()}
-    if _ext_fns
-    else {
-        "ExtractAST": lambda a: _extract_ast(**a),
-        "ASTSplice": lambda a: _ast_splice(**a),
-        "QueryLSP": lambda a: _query_lsp(**a),
-    }
-)
+_LOCAL_FNS: dict[str, Any] = {
+    "Execute_Bash": lambda a: _execute_bash(**a),
+}
 
 # ---------------------------------------------------------------------------
 # In-flight tracker — prevents double-dispatch of the same task ID
@@ -375,7 +207,7 @@ def _release(task_id: str) -> None:
 def _read_task(path: Path) -> Optional[TaskFile]:
     try:
         return TaskFile.model_validate_json(path.read_text(encoding="utf-8"))
-    except (ValidationError, json.JSONDecodeError, OSError) as exc:
+    except (ValidationError, Exception) as exc:
         print(f"[thunkd] WARN: cannot read {path.name}: {exc}")
         return None
 
@@ -481,10 +313,14 @@ def _build_initial_messages(task: TaskFile) -> list[dict]:
         lines.append(f"Parent context: {task.parent_context}")
 
     system = (
-        "You are an isolated, stateless worker. "
-        "Use your injected tools to achieve the intent, then reply with a terse final answer. "
+        "You are an isolated, stateless bash worker. "
+        "Use Execute_Bash to explore the codebase (cat, grep, find, ls), "
+        "modify files (sed, awk, patch, or write via shell redirection), "
+        "and validate your work (pytest, flake8, npm run build). "
         "You have no memory of prior conversations. "
-        "Tool failures are fatal — a malformed call terminates you immediately, so get it right the first time."
+        "A failed command (non-zero exit) terminates you immediately — "
+        "check your syntax before running. "
+        "When the task is complete, reply with a terse final answer."
     )
     return [
         {"role": "system", "content": system},
@@ -537,8 +373,8 @@ def _execute(path: Path) -> None:
                 mutating_allowed = set(task.allowed_tools) & _MUTATING_TOOLS
                 if mutating_allowed and not (called_tool_names & _MUTATING_TOOLS):
                     err = (
-                        "[Harness Error] Child agent hallucinated completion without "
-                        f"executing mutating tools (allowed: {sorted(mutating_allowed)})."
+                        "[Harness Error] Agent declared completion without "
+                        f"ever calling its tools (allowed: {sorted(mutating_allowed)})."
                     )
                     _patch_task(path, status="failed", result=err)
                     print(f"[thunkd] [{task.id}] FAILED (anti-yap): {err}")
@@ -684,9 +520,9 @@ def _find_pending() -> list[Path]:
 
 def run() -> None:
     THUNK_DIR.mkdir(exist_ok=True)
-    tool_source = "ariadne package" if _ext_fns else "mock stubs"
+    shell_desc = SHELL_EXE or "system default"
     print(f"[thunkd] watching {THUNK_DIR.resolve()}  model={MODEL}  api_base={API_BASE}")
-    print(f"[thunkd] tools loaded from: {tool_source}  {list(_LOCAL_FNS.keys())}")
+    print(f"[thunkd] bash worker  shell={shell_desc}  timeout={BASH_TIMEOUT}s")
     try:
         while True:
             _resume_ready_suspended()
