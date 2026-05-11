@@ -118,7 +118,7 @@ The architecture relies on the local environment being "UNIX-like," which create
 
   Shell Injection: While thunkd.py is hardwired to MSYS2 bash to prevent cmd.exe collisions, the system essentially executes raw strings from an LLM directly into your shell. A malicious or highly confused model could execute unintended system-level commands.
 
-  VRAM/System Instability: Running 30B+ models alongside high-context 9B workers pushes consumer hardware (like your 7700 XT and 5600G) to its thermal and memory limits. If the thermal limits are pushed too far (the "microwave" scenario), it could lead to system crashes or hardware degradation.
+  VRAM/System Instability: Running 30B+ models alongside high-context 9B workers pushes consumer hardware to its thermal and memory limits. If the thermal limits are pushed too far (the "microwave" scenario), it could lead to system crashes or hardware degradation.
 
 Recommended Mitigations
 
