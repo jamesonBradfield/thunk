@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -46,6 +47,8 @@ API_BASE = os.getenv("THUNK_API_BASE", "http://localhost:8080/v1")
 POLL_INTERVAL = float(os.getenv("THUNK_POLL", "1.0"))
 BASH_TIMEOUT = int(os.getenv("THUNK_BASH_TIMEOUT", "120"))
 SHELL_EXE = os.getenv("THUNK_SHELL", "C:/Users/jamie/scoop/apps/msys2/current/usr/bin/bash.exe")
+# Intent strings longer than this in a Create_Thunk call get collapsed to a commit hash pointer.
+INTENT_COLLAPSE_THRESHOLD = int(os.getenv("THUNK_INTENT_COLLAPSE", "500"))
 
 # Tools whose presence implies the agent must do actual work.
 # If allowed but never called, the Anti-Yapping guardrail fails the task.
@@ -297,6 +300,65 @@ def _msg_to_dict(msg: Any) -> dict:
     return d
 
 
+# Matches a full 40-char hash, or the word "commit" followed by a short/full hash.
+_COMMIT_HASH_RE = re.compile(
+    r"\b([0-9a-f]{40})\b|[Cc]ommit[:\s]+([0-9a-f]{7,40})\b"
+)
+
+
+def _extract_commit_hash(text: str) -> str | None:
+    """Return the first git commit hash found in text, or None."""
+    m = _COMMIT_HASH_RE.search(text)
+    if m:
+        return m.group(1) or m.group(2)
+    return None
+
+
+def _collapse_intent_in_tape(
+    messages: list[dict],
+    tool_call_id: str,
+    commit_hash: str,
+) -> list[dict]:
+    """Replace oversized Create_Thunk intent args in the parent tape with a commit hash pointer.
+
+    Keeps the parent's context window lean after a child commits a large artefact.
+    Only collapses intents longer than INTENT_COLLAPSE_THRESHOLD chars.
+    """
+    result = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls:
+                new_tcs = []
+                mutated = False
+                for tc in tool_calls:
+                    if (
+                        tc.get("id") == tool_call_id
+                        and tc.get("function", {}).get("name") == "Create_Thunk"
+                    ):
+                        try:
+                            args = json.loads(tc["function"]["arguments"])
+                            if len(args.get("intent", "")) > INTENT_COLLAPSE_THRESHOLD:
+                                args["intent"] = (
+                                    f"[COLLAPSED — refer to git commit {commit_hash}]"
+                                )
+                                tc = {
+                                    **tc,
+                                    "function": {
+                                        **tc["function"],
+                                        "arguments": json.dumps(args),
+                                    },
+                                }
+                                mutated = True
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                    new_tcs.append(tc)
+                if mutated:
+                    msg = {**msg, "tool_calls": new_tcs}
+        result.append(msg)
+    return result
+
+
 def _build_initial_messages(task: TaskFile) -> list[dict]:
     """Construct the single static prompt for a fresh (non-resumed) task."""
     lines = [f"Intent: {task.intent}"]
@@ -310,13 +372,18 @@ def _build_initial_messages(task: TaskFile) -> list[dict]:
         lines.append(f"Parent context: {task.parent_context}")
 
     system = (
-        "You are an isolated, stateless bash worker. "
+        "You are an isolated, stateless bash worker running in a Linux environment. "
         "Use Execute_Bash to explore the codebase (cat, grep, find, ls), "
         "modify files (sed, awk, patch, or write via shell redirection), "
-        "and validate your work (pytest, flake8, npm run build). "
+        "and validate your work (use python3, pytest, flake8, npm run build, etc.). "
         "You have no memory of prior conversations. "
         "A failed command (non-zero exit) terminates you immediately — "
         "check your syntax before running. "
+        "If you modified any files, you MUST commit your changes before declaring success. "
+        "Stage only your target files, then commit if anything is staged — one Execute_Bash call: "
+        f"`git add {' '.join(task.target_files) if task.target_files else '-A'}; "
+        "git diff --cached --quiet || git commit -m '<terse one-line description>'; git rev-parse HEAD` "
+        "and include the printed 40-character commit hash in your final answer. "
         "When the task is complete, reply with a terse final answer."
     )
     return [
@@ -358,7 +425,20 @@ def _execute(path: Path) -> None:
                 kwargs["tools"] = schemas
                 kwargs["tool_choice"] = "auto"
 
-            response = litellm.completion(**kwargs)
+            # Retry on transient server errors (model loading, rate limits).
+            for _attempt in range(5):
+                try:
+                    response = litellm.completion(**kwargs)
+                    break
+                except (
+                    litellm.exceptions.ServiceUnavailableError,
+                    litellm.exceptions.RateLimitError,
+                ) as _e:
+                    wait = 5 * (_attempt + 1)
+                    print(f"[thunkd] [{task.id}] transient error ({_e.__class__.__name__}), retry in {wait}s…")
+                    time.sleep(wait)
+            else:
+                raise RuntimeError("LLM unavailable after 5 retries")
             msg = response.choices[0].message
             messages.append(_msg_to_dict(msg))
 
@@ -487,6 +567,20 @@ def _resume_ready_suspended() -> None:
             else child_output
         )
         messages = list(parent.messages or [])
+
+        # Context collapse: if the child committed something, shrink the
+        # Create_Thunk call that spawned it down to a hash pointer so the
+        # parent's tape doesn't balloon with inline code.
+        if child.status == "success" and parent.pending_tool_call_id:
+            commit_hash = _extract_commit_hash(child_output)
+            if commit_hash:
+                messages = _collapse_intent_in_tape(
+                    messages, parent.pending_tool_call_id, commit_hash
+                )
+                print(
+                    f"[thunkd] [{parent.id}] collapsed Create_Thunk intent → {commit_hash}"
+                )
+
         messages.append(
             {
                 "role": "tool",
