@@ -7,3 +7,7 @@ def run_all(values):
 
 if __name__ == "__main__":
     print(run_all([1, 2, 3]))
+
+
+def multiply(a, b):
+    return a * b
