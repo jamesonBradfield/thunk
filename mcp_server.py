@@ -43,12 +43,7 @@ async def list_tools() -> list[types.Tool]:
                 "Dispatch an atomic task to the local Thunk worker daemon. "
                 "Workers use bash to explore, modify, and validate the codebase in isolation. "
                 "The Brain never touches the codebase directly — only this tool. "
-                "On success the worker returns a terse summary; if files were modified it also "
-                "returns the git commit hash so you can reference changes by hash instead of "
-                "copying file contents into context. "
-                "IMPORTANT: keep 'intent' high-level — describe WHAT to do, not HOW. "
-                "Never inline code or file contents in intent; the worker reads the files itself. "
-                "Failure and timeout messages are prefixed with [FAILED] or [TIMEOUT]."
+                "Returns the worker's terse final output, or a failure/timeout message."
             ),
             inputSchema={
                 "type": "object",
