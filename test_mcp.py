@@ -40,8 +40,10 @@ async def main() -> None:
                 "Dispatch_Thunk",
                 {
                     "intent": (
-                        "Append a multiply(a, b) function to fixtures/demo_b.py "
-                        "that returns a * b. Run it once with python3 to verify. "
+                        "Append a power(base, exp) function to fixtures/demo_b.py "
+                        "that returns base ** exp. "
+                        "Verify by running: cd fixtures && python3 -c "
+                        "\"from demo_b import power; print(power(2, 8))\". "
                         "Commit and return the hash."
                     ),
                     "target_files": ["fixtures/demo_b.py"],

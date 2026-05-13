@@ -35,7 +35,10 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 import litellm
+from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -213,9 +216,10 @@ def _read_task(path: Path) -> Optional[TaskFile]:
 
 
 def _write_task(task: TaskFile, path: Path) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(task.model_dump_json(indent=2), encoding="utf-8")
-    tmp.replace(path)
+    # Write directly — atomic temp+rename fails on NTFS (WSL) when the
+    # destination is briefly held by a concurrent reader (mcp_server poll).
+    # _read_task already wraps reads in try/except for concurrent safety.
+    path.write_text(task.model_dump_json(indent=2), encoding="utf-8")
 
 
 def _patch_task(path: Path, **updates: Any) -> Optional[TaskFile]:
