@@ -21,3 +21,7 @@ def divide(a, b):
 
 def power(base, exp):
     return base ** exp
+
+
+def modulo(a, b):
+    return a % b
