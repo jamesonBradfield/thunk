@@ -49,6 +49,7 @@ MODEL = os.getenv("THUNK_MODEL", "openai/local")
 API_BASE = os.getenv("THUNK_API_BASE", "http://localhost:8080/v1")
 POLL_INTERVAL = float(os.getenv("THUNK_POLL", "1.0"))
 BASH_TIMEOUT = int(os.getenv("THUNK_BASH_TIMEOUT", "120"))
+MAX_TOKENS = int(os.getenv("THUNK_MAX_TOKENS", "8192"))
 SHELL_EXE = os.getenv("THUNK_SHELL", "C:/Users/jamie/scoop/apps/msys2/current/usr/bin/bash.exe")
 # Intent strings longer than this in a Create_Thunk call get collapsed to a commit hash pointer.
 INTENT_COLLAPSE_THRESHOLD = int(os.getenv("THUNK_INTENT_COLLAPSE", "500"))
@@ -363,6 +364,31 @@ def _collapse_intent_in_tape(
     return result
 
 
+def _get_git_head() -> str | None:
+    """Return the current git HEAD hash, or None if unavailable."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        h = proc.stdout.strip()
+        return h if re.fullmatch(r"[0-9a-f]{40}", h) else None
+    except Exception:
+        return None
+
+
+def _files_changed_since(base_hash: str) -> list[str]:
+    """Return all files that differ between base_hash and HEAD."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", base_hash, "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return [f for f in proc.stdout.strip().splitlines() if f]
+    except Exception:
+        return []
+
+
 def _build_initial_messages(task: TaskFile) -> list[dict]:
     """Construct the single static prompt for a fresh (non-resumed) task."""
     lines = [f"Intent: {task.intent}"]
@@ -416,6 +442,7 @@ def _execute(path: Path) -> None:
     ]
     messages: list[dict] = list(task.messages) if resumed else _build_initial_messages(task)
     called_tool_names: set[str] = set()
+    pre_task_head = _get_git_head()
 
     try:
         while True:
@@ -424,6 +451,7 @@ def _execute(path: Path) -> None:
                 "api_base": API_BASE,
                 "api_key": os.getenv("OPENAI_API_KEY", "sk-no-key-required"),
                 "messages": messages,
+                "max_tokens": MAX_TOKENS,
             }
             if schemas:
                 kwargs["tools"] = schemas
@@ -460,6 +488,32 @@ def _execute(path: Path) -> None:
                     _patch_task(path, status="failed", result=err)
                     print(f"[thunkd] [{task.id}] FAILED (anti-yap): {err}")
                     return
+                # Harness-level post-commit checks (issues #1 and #2).
+                post_task_head = _get_git_head()
+                commit_hash = (
+                    post_task_head
+                    if (pre_task_head and post_task_head and pre_task_head != post_task_head)
+                    else None
+                )
+
+                # Issue #1: enforce target_files scope.
+                if commit_hash and task.target_files:
+                    changed = _files_changed_since(pre_task_head)  # type: ignore[arg-type]
+                    out_of_scope = [f for f in changed if f not in task.target_files]
+                    if out_of_scope:
+                        err = (
+                            f"[Harness Error] commit {commit_hash[:8]} touched files "
+                            f"outside target_files {task.target_files}: {out_of_scope}"
+                        )
+                        _patch_task(path, status="failed", result=err)
+                        print(f"[thunkd] [{task.id}] FAILED (scope violation): {err}")
+                        return
+
+                # Issue #2: inject the authoritative full hash so _extract_commit_hash
+                # in _resume_ready_suspended is reliable regardless of model output format.
+                if commit_hash:
+                    final = final + f"\ncommit: {commit_hash}"
+
                 _patch_task(path, status="success", result=final)
                 print(f"[thunkd] [{task.id}] success: {final[:80]!r}")
                 return

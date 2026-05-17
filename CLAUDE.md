@@ -39,6 +39,7 @@ pip install litellm pydantic python-dotenv mcp
 | `OPENAI_API_KEY` | *(not required for llama-server)* | API key |
 | `THUNK_SHELL` | `msys2/current/usr/bin/bash.exe` | Shell for `Execute_Bash` — always bash, never cmd.exe |
 | `THUNK_BASH_TIMEOUT` | `120` | Per-command timeout in seconds |
+| `THUNK_MAX_TOKENS` | `8192` | Max tokens per LLM call — raise for thinking models (Qwen3, QwQ) that consume tokens in reasoning before producing output |
 | `THUNK_DISPATCH_TIMEOUT` | `300` | Max seconds `mcp_server.py` waits per task |
 
 Designed to work against a local `llama-server` or any OpenAI-compatible endpoint.
